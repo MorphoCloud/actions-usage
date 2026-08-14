@@ -1,0 +1,115 @@
+name: Monthly Usage Snapshot
+
+# Saves the previous month's org-wide Actions billing usage (per-repo,
+# per-day, per-SKU line items) to data/YYYY-MM.json on the second Sunday
+# of each month. GitHub's own retention makes this necessary: the UI
+# summarized report only goes back 1 year and the API window is not
+# documented, so history we do not save is history we may lose.
+on:
+  schedule:
+    # Every Sunday; the gate step below selects the second one. Cron cannot
+    # express "second Sunday" directly: restricting both day-of-month and
+    # day-of-week fires on the UNION of the two (POSIX cron semantics).
+    - cron: "23 14 * * 0"
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Year to snapshot (blank = previous month)"
+        required: false
+        default: ""
+      month:
+        description: "Month 1-12 (blank = previous month)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on second Sunday
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          d=$(date -u +%-d)
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || { [ "$d" -ge 8 ] && [ "$d" -le 14 ]; }; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Not the second Sunday (day $d); nothing to do."
+          fi
+
+      - uses: actions/checkout@v6
+        if: ${{ steps.gate.outputs.run == 'true' }}
+
+      - name: Resolve target month
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: target
+        env:
+          INPUT_YEAR: ${{ inputs.year }}
+          INPUT_MONTH: ${{ inputs.month }}
+        run: |
+          if [ -n "$INPUT_YEAR" ] && [ -n "$INPUT_MONTH" ]; then
+            Y=$INPUT_YEAR
+            M=$((10#$INPUT_MONTH))
+          else
+            Y=$(date -u -d "$(date -u +%Y-%m-01) - 1 day" +%Y)
+            M=$(date -u -d "$(date -u +%Y-%m-01) - 1 day" +%-m)
+          fi
+          echo "year=$Y" >> "$GITHUB_OUTPUT"
+          echo "month=$M" >> "$GITHUB_OUTPUT"
+          echo "file=data/$Y-$(printf '%02d' "$M").json" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch usage report
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.ORG_BILLING_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          YEAR: ${{ steps.target.outputs.year }}
+          MONTH: ${{ steps.target.outputs.month }}
+          OUT: ${{ steps.target.outputs.file }}
+        run: |
+          gh api "organizations/$ORG/settings/billing/usage?year=$YEAR&month=$MONTH" > raw.json
+          jq -e '.usageItems' raw.json > /dev/null
+          # The API returns an empty list both for "no usage" and for months
+          # outside its retention window. This org has daily cron activity, so
+          # an empty month means the fetch is wrong, not that usage was zero.
+          test "$(jq '.usageItems | length' raw.json)" -gt 0
+          jq . raw.json > "$OUT"
+          rm raw.json
+
+      - name: Commit snapshot
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        env:
+          OUT: ${{ steps.target.outputs.file }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$OUT"
+          if git diff --cached --quiet; then
+            echo "Snapshot unchanged; nothing to commit."
+          else
+            git commit -m "snapshot: $OUT"
+            git push
+          fi
+
+  alert-on-failure:
+    needs: snapshot
+    if: ${{ always() && needs.snapshot.result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Email failure alert
+        uses: dawidd6/action-send-mail@62a2d05b79935ad4fb90ce9079928099579c14ac # v9
+        with:
+          server_address: webhost.dynadot.com
+          server_port: 587
+          secure: false
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: MorphoCloud Actions Usage <no-reply@morphocloud.org>
+          to: ${{ vars.ADMIN_EMAIL }}
+          subject: "[actions-usage] monthly billing snapshot FAILED"
+          body: "The monthly Actions usage snapshot did not save. Without it this month's billing history may age out of GitHub's retention. Details: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
