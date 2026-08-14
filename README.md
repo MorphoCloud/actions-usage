@@ -25,10 +25,15 @@ jq '[.usageItems[].netAmount] | add' data/2026-07.json
 
 ## How it updates
 
-`monthly-snapshot.yml` runs on the second Sunday of each month and commits
-the previous month. It fails loudly (email to the admin) rather than
-skipping silently. Manual runs can backfill any month still inside GitHub's
-API window via workflow dispatch.
+Manually, once a month after the month closes: `scripts/snapshot.sh`
+(run locally by an org admin) fetches the previous month and commits it.
+There is no Actions workflow on purpose — the billing endpoint rejects
+fine-grained PATs and `GITHUB_TOKEN`, and we are not willing to park an
+`admin:org` classic token in repo secrets. A scheduled reminder covers
+the "remember to run it" half.
+
+`scripts/snapshot.sh 2026-05` backfills a specific month, while it is
+still inside GitHub's API window.
 
 Caveats for later analysis:
 
